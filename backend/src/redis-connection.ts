@@ -25,3 +25,9 @@ export function createWorkerRedisConnection(): Redis {
     retryStrategy: (attempt) => Math.min(attempt * 500, 5_000),
   });
 }
+
+export async function closeRedisConnection(connection: Redis): Promise<void> {
+  if (connection.status !== "end") {
+    await connection.quit();
+  }
+}
