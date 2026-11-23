@@ -35,6 +35,7 @@ export async function deliverWebhook(
         method: "POST",
         headers: {
           "content-type": "application/json",
+          "x-hookflow-event-id": `${job.queueName}:${job.id}`,
           "x-hookflow-job-id": String(job.id),
           "x-hookflow-attempt": String(attemptNumber),
         },

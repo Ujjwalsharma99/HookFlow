@@ -1,15 +1,25 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { createServer } from "node:http";
-import type { AddressInfo } from "node:net";
-import { after, before, test } from "node:test";
+import express from "express";
+import { test } from "node:test";
 import { Queue, Worker } from "bullmq";
 import {
   closeRedisConnection,
   createApiRedisConnection,
   createWorkerRedisConnection,
+  waitForRedisReady,
 } from "./redis-connection.js";
 import { deliverWebhook } from "./webhook-delivery.js";
+import {
+  deleteBusinessOperationRecord,
+  getBusinessOperationRecord,
+} from "./receiver-idempotency.js";
+import {
+  enqueueWebhookEvent,
+  idempotencyKeyHash,
+  IDEMPOTENCY_RETENTION_MS,
+  isValidIdempotencyKey,
+} from "./webhook-idempotency.js";
 import {
   INITIAL_BACKOFF_MS,
   MAX_DELIVERY_ATTEMPTS,
@@ -19,79 +29,80 @@ import {
   WEBHOOK_DELIVERY_QUEUE_NAME,
   webhookJobOptions,
 } from "./webhook-jobs.js";
-
-const previousPort = process.env.PORT;
-const receiverRequests: Array<{ jobId: string; attempt: number; path: string; status: number }> = [];
-let receiverServer: ReturnType<typeof createServer>;
-
-before(async () => {
-  receiverServer = createServer((request, response) => {
-    const path = request.url ?? "";
-    const jobId = request.headers["x-hookflow-job-id"];
-    const attempt = Number(request.headers["x-hookflow-attempt"]);
-
-    if (request.method !== "POST" || typeof jobId !== "string" || !Number.isInteger(attempt)) {
-      response.writeHead(400).end();
-      return;
-    }
-
-    const status = path.endsWith("/success")
-      ? 200
-      : path.endsWith("/transient")
-        ? attempt <= 2
-          ? 500
-          : 200
-        : path.endsWith("/failure")
-          ? 500
-          : path.endsWith("/permanent")
-            ? 400
-            : 404;
-
-    receiverRequests.push({ jobId, attempt, path, status });
-    request.resume();
-    response.writeHead(status, { "content-type": "application/json" });
-    response.end(JSON.stringify({ received: status >= 200 && status < 300 }));
-  });
-
-  await new Promise<void>((resolve, reject) => {
-    receiverServer.once("error", reject);
-    receiverServer.listen(0, "127.0.0.1", resolve);
-  });
-  process.env.PORT = String((receiverServer.address() as AddressInfo).port);
-});
-
-after(async () => {
-  await new Promise<void>((resolve, reject) => {
-    receiverServer.close((error) => (error ? reject(error) : resolve()));
-  });
-  if (previousPort === undefined) delete process.env.PORT;
-  else process.env.PORT = previousPort;
-});
+import { createWebhookApi } from "./webhook-api.js";
 
 async function createHarness() {
   const queueName = `${WEBHOOK_DELIVERY_QUEUE_NAME}-test-${randomUUID()}`;
+  const previousPort = process.env.PORT;
   const queueConnection = createApiRedisConnection();
+  await waitForRedisReady(queueConnection);
   const workerConnection = createWorkerRedisConnection();
   const queue = new Queue<WebhookEventData, WebhookDeliveryResult>(queueName, {
     connection: queueConnection,
     defaultJobOptions: webhookJobOptions,
   });
+  const app = express();
+  app.use(express.json({ limit: "16kb" }));
+  app.use("/api", createWebhookApi(queue, queueConnection));
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve, reject) => {
+    server.once("listening", resolve);
+    server.once("error", reject);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Test API did not bind to a TCP port");
+  process.env.PORT = String(address.port);
+
   const worker = new Worker<WebhookEventData, WebhookDeliveryResult>(queueName, deliverWebhook, {
     connection: workerConnection,
   });
+  await Promise.all([queue.waitUntilReady(), worker.waitUntilReady()]);
 
+  const idempotencyKeyHashes: string[] = [];
+  const eventIds = new Set<string>();
+  worker.on("active", (job) => eventIds.add(`${job.queueName}:${job.id}`));
   return {
     queue,
+    redis: queueConnection,
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    rememberIdempotencyKey(key: string) {
+      idempotencyKeyHashes.push(idempotencyKeyHash(key));
+    },
     async close() {
       await worker.close();
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
       await queue.obliterate({ force: true });
+      for (const eventId of eventIds) {
+        await deleteBusinessOperationRecord(queueConnection, eventId);
+      }
+      for (const keyHash of idempotencyKeyHashes) {
+        await queueConnection.del(`hookflow:idempotency:${keyHash}`, `hookflow:idempotency:${keyHash}:lease`);
+      }
       await queue.close();
       await Promise.all([
         closeRedisConnection(queueConnection),
         closeRedisConnection(workerConnection),
       ]);
+      if (previousPort === undefined) delete process.env.PORT;
+      else process.env.PORT = previousPort;
     },
   };
+}
+
+async function postEvent(
+  baseUrl: string,
+  event: Pick<WebhookEventData, "eventType" | "payload" | "scenario">,
+  idempotencyKey?: string,
+): Promise<Response> {
+  const headers = new Headers({ "content-type": "application/json" });
+  if (idempotencyKey) headers.set("Idempotency-Key", idempotencyKey);
+  return fetch(`${baseUrl}/api/webhook-events`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(event),
+  });
 }
 
 async function waitForJob(queue: Queue<WebhookEventData, WebhookDeliveryResult>, jobId: string) {
@@ -134,7 +145,6 @@ async function addJob(
 }
 
 test("successful receiver completes after one HTTP delivery", async () => {
-  receiverRequests.length = 0;
   assert.equal(webhookJobOptions.attempts, MAX_DELIVERY_ATTEMPTS);
   assert.deepEqual(webhookJobOptions.backoff, { type: "exponential", delay: INITIAL_BACKOFF_MS });
   assert.equal(webhookJobOptions.removeOnFail, false);
@@ -148,14 +158,14 @@ test("successful receiver completes after one HTTP delivery", async () => {
     assert.deepEqual(finished.job.returnvalue, { delivered: true, statusCode: 200 });
     assert.equal(finished.job.data.attemptHistory.length, 1);
     assert.equal(finished.job.data.attemptHistory[0]?.outcome, "success");
-    assert.equal(receiverRequests.filter((entry) => entry.jobId === job.id).length, 1);
+    const operation = await getBusinessOperationRecord(harness.redis, `${job.queueName}:${job.id}`);
+    assert.equal(operation?.executionCount, 1);
   } finally {
     await harness.close();
   }
 });
 
 test("transient receiver recovers on attempt three with isolated per-job numbering", async () => {
-  receiverRequests.length = 0;
   const harness = await createHarness();
   try {
     const jobs = await Promise.all([
@@ -177,13 +187,17 @@ test("transient receiver recovers on attempt three with isolated per-job numberi
         result.job.data.attemptHistory.map((attempt) => attempt.attemptNumber),
         [1, 2, 3],
       );
+      assert.deepEqual(
+        result.job.data.attemptHistory.map((attempt) => attempt.httpStatus),
+        [500, 500, 200],
+      );
     }
 
     for (const job of jobs) {
-      const attempts = receiverRequests
-        .filter((entry) => entry.jobId === job.id)
-        .map((entry) => [entry.attempt, entry.status]);
-      assert.deepEqual(attempts, [[1, 500], [2, 500], [3, 200]]);
+      const eventId = `${job.queueName}:${job.id}`;
+      const operation = await getBusinessOperationRecord(harness.redis, eventId);
+      assert.equal(operation?.executionCount, 1);
+      assert.equal(operation?.deliveryAttempts, 3);
     }
   } finally {
     await harness.close();
@@ -191,7 +205,6 @@ test("transient receiver recovers on attempt three with isolated per-job numberi
 });
 
 test("retryable HTTP 500 exhausts all three attempts and keeps history", async () => {
-  receiverRequests.length = 0;
   const harness = await createHarness();
   try {
     const job = await addJob(harness.queue, "failure");
@@ -201,14 +214,13 @@ test("retryable HTTP 500 exhausts all three attempts and keeps history", async (
     assert.equal(finished.job.attemptsMade, 3);
     assert.equal(finished.job.data.attemptHistory.length, 3);
     assert.ok(finished.job.failedReason?.includes("HTTP 500"));
-    assert.ok(receiverRequests.filter((entry) => entry.jobId === job.id).every((entry) => entry.status === 500));
+    assert.ok(finished.job.data.attemptHistory.every((attempt) => attempt.httpStatus === 500));
   } finally {
     await harness.close();
   }
 });
 
 test("permanent HTTP 400 fails immediately without automatic retries", async () => {
-  receiverRequests.length = 0;
   const harness = await createHarness();
   try {
     const job = await addJob(harness.queue, "permanent");
@@ -219,8 +231,168 @@ test("permanent HTTP 400 fails immediately without automatic retries", async () 
     assert.equal(finished.job.data.attemptHistory.length, 1);
     assert.equal(finished.job.data.attemptHistory[0]?.outcome, "permanent_failure");
     assert.ok(finished.job.failedReason?.includes("permanent HTTP 400"));
-    assert.equal(receiverRequests.filter((entry) => entry.jobId === job.id).length, 1);
   } finally {
     await harness.close();
   }
+});
+
+const eventForIdempotency: WebhookEventData = {
+  eventType: "order.created",
+  payload: { orderId: "idempotent-order" },
+  scenario: "success",
+  attemptHistory: [],
+};
+
+test("submission without an idempotency key keeps normal enqueue behavior", async () => {
+  const harness = await createHarness();
+  try {
+    const response = await postEvent(harness.baseUrl, {
+      eventType: eventForIdempotency.eventType,
+      payload: eventForIdempotency.payload,
+      scenario: eventForIdempotency.scenario,
+    });
+    const body = (await response.json()) as { jobId: string };
+
+    assert.equal(response.status, 202);
+    assert.ok(body.jobId);
+    assert.equal(body.jobId.startsWith("idem-"), false);
+    assert.ok(await harness.queue.getJob(body.jobId));
+  } finally {
+    await harness.close();
+  }
+});
+
+test("malformed idempotency keys are rejected before enqueue", async () => {
+  const harness = await createHarness();
+  try {
+    const response = await postEvent(
+      harness.baseUrl,
+      {
+        eventType: eventForIdempotency.eventType,
+        payload: eventForIdempotency.payload,
+        scenario: eventForIdempotency.scenario,
+      },
+      "invalid key with spaces",
+    );
+    assert.equal(response.status, 400);
+    const jobs = await harness.queue.getJobCounts("wait", "active", "delayed", "completed", "failed");
+    assert.equal(Object.values(jobs).reduce((sum, count) => sum + count, 0), 0);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("same idempotency key reuses its job and conflicts on different event data", async () => {
+  const harness = await createHarness();
+  const key = `same-key-${randomUUID()}`;
+  harness.rememberIdempotencyKey(key);
+  try {
+    const event = {
+      eventType: eventForIdempotency.eventType,
+      payload: eventForIdempotency.payload,
+      scenario: eventForIdempotency.scenario,
+    };
+    const firstResponse = await postEvent(harness.baseUrl, event, key);
+    const first = (await firstResponse.json()) as { jobId: string };
+    const duplicateResponse = await postEvent(harness.baseUrl, event, key);
+    const duplicate = (await duplicateResponse.json()) as { jobId: string };
+    const conflictResponse = await postEvent(
+      harness.baseUrl,
+      { ...event, payload: { orderId: "different-order" } },
+      key,
+    );
+
+    assert.equal(firstResponse.status, 202);
+    assert.equal(duplicateResponse.status, 202);
+    assert.equal(duplicate.jobId, first.jobId);
+    assert.equal(conflictResponse.status, 409);
+    const jobs = await harness.queue.getJobCounts("wait", "active", "delayed", "completed", "failed");
+    assert.equal(Object.values(jobs).reduce((sum, count) => sum + count, 0), 1);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("concurrent identical submissions create one logical BullMQ job", async () => {
+  const harness = await createHarness();
+  const key = `concurrent-${randomUUID()}`;
+  harness.rememberIdempotencyKey(key);
+  try {
+    const event = {
+      eventType: eventForIdempotency.eventType,
+      payload: eventForIdempotency.payload,
+      scenario: eventForIdempotency.scenario,
+    };
+    const submissions = await Promise.all(
+      Array.from({ length: 8 }, () => postEvent(harness.baseUrl, event, key)),
+    );
+
+    assert.ok(submissions.every((response) => response.status === 202));
+    const results = await Promise.all(
+      submissions.map((response) => response.json() as Promise<{ jobId: string }>),
+    );
+    const jobIds = results.map((result) => result.jobId);
+    assert.equal(new Set(jobIds).size, 1);
+    const jobs = await harness.queue.getJobCounts("wait", "active", "delayed", "completed", "failed");
+    assert.equal(Object.values(jobs).reduce((sum, count) => sum + count, 0), 1);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("enqueue failures release their lease so the same key can recover", async () => {
+  const harness = await createHarness();
+  const key = `recover-${randomUUID()}`;
+  harness.rememberIdempotencyKey(key);
+  const originalAdd = harness.queue.add.bind(harness.queue);
+  try {
+    harness.queue.add = (async () => {
+      throw new Error("simulated queue enqueue failure");
+    }) as typeof harness.queue.add;
+
+    const failed = await enqueueWebhookEvent(harness.queue, harness.redis, eventForIdempotency, key);
+    assert.equal(failed.status, 503);
+
+    harness.queue.add = originalAdd;
+    const recovered = await enqueueWebhookEvent(harness.queue, harness.redis, eventForIdempotency, key);
+    assert.equal(recovered.status, 202);
+    if (recovered.status !== 202) assert.fail("Expected retry after enqueue failure to be accepted");
+    const reservation = JSON.parse(
+      (await harness.redis.get(`hookflow:idempotency:${idempotencyKeyHash(key)}`)) ?? "{}",
+    ) as { jobId?: string };
+    assert.equal(recovered.jobId, reservation.jobId);
+    assert.ok(await harness.queue.getJob(recovered.jobId));
+  } finally {
+    harness.queue.add = originalAdd;
+    await harness.close();
+  }
+});
+
+test("an expired idempotency record permits a new submission", async () => {
+  const harness = await createHarness();
+  const key = `expires-${randomUUID()}`;
+  harness.rememberIdempotencyKey(key);
+  try {
+    const first = await enqueueWebhookEvent(harness.queue, harness.redis, eventForIdempotency, key);
+    assert.equal(first.status, 202);
+    const keyHash = idempotencyKeyHash(key);
+    await harness.redis.pexpire(`hookflow:idempotency:${keyHash}`, 1);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const afterExpiry = await enqueueWebhookEvent(harness.queue, harness.redis, eventForIdempotency, key);
+    assert.equal(afterExpiry.status, 202);
+    assert.notEqual(
+      "jobId" in afterExpiry ? afterExpiry.jobId : "",
+      "jobId" in first ? first.jobId : "",
+    );
+    assert.equal(IDEMPOTENCY_RETENTION_MS, 24 * 60 * 60 * 1_000);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("idempotency keys accept bounded safe characters", () => {
+  assert.equal(isValidIdempotencyKey("order-123_A.~"), true);
+  assert.equal(isValidIdempotencyKey("bad key"), false);
+  assert.equal(isValidIdempotencyKey("x".repeat(129)), false);
 });

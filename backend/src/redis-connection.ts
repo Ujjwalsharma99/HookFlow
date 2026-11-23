@@ -31,3 +31,19 @@ export async function closeRedisConnection(connection: Redis): Promise<void> {
     await connection.quit();
   }
 }
+
+export async function waitForRedisReady(connection: Redis): Promise<void> {
+  if (connection.status === "ready") return;
+  await new Promise<void>((resolve, reject) => {
+    const onReady = () => {
+      connection.off("error", onError);
+      resolve();
+    };
+    const onError = (error: Error) => {
+      connection.off("ready", onReady);
+      reject(error);
+    };
+    connection.once("ready", onReady);
+    connection.once("error", onError);
+  });
+}
