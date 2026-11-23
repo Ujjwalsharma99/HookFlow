@@ -146,8 +146,12 @@ export async function enqueueWebhookEvent(
   redis: Redis,
   event: WebhookEventData,
   idempotencyKey?: string,
+  maximumPending = 500,
 ): Promise<EnqueueWebhookResult> {
   if (!idempotencyKey) {
+    if (await hasReachedPendingLimit(queue, maximumPending)) {
+      return { status: 503, error: "Webhook queue is at capacity; retry shortly", retryAfter: 5 };
+    }
     const job = await queue.add("deliver-webhook", event);
     return { status: 202, jobId: String(job.id) };
   }
@@ -194,6 +198,10 @@ export async function enqueueWebhookEvent(
     try {
       const existingJob = await queue.getJob(reservation.jobId);
       if (!existingJob) {
+        if (await hasReachedPendingLimit(queue, maximumPending)) {
+          await releaseIdempotencyLease(redis, keyHash, ownerToken);
+          return { status: 503, error: "Webhook queue is at capacity; retry shortly", retryAfter: 5 };
+        }
         await queue.add("deliver-webhook", event, { jobId: reservation.jobId });
       }
       await markIdempotencyKeyReady(redis, keyHash, fingerprint, reservation.jobId, ownerToken);
@@ -217,4 +225,12 @@ export async function enqueueWebhookEvent(
       };
     }
   }
+}
+
+async function hasReachedPendingLimit(
+  queue: Queue<WebhookEventData, WebhookDeliveryResult>,
+  maximumPending: number,
+): Promise<boolean> {
+  const counts = await queue.getJobCounts("wait", "active", "delayed", "prioritized");
+  return Object.values(counts).reduce((total, count) => total + count, 0) >= maximumPending;
 }

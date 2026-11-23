@@ -147,7 +147,8 @@ async function addJob(
 test("successful receiver completes after one HTTP delivery", async () => {
   assert.equal(webhookJobOptions.attempts, MAX_DELIVERY_ATTEMPTS);
   assert.deepEqual(webhookJobOptions.backoff, { type: "exponential", delay: INITIAL_BACKOFF_MS });
-  assert.equal(webhookJobOptions.removeOnFail, false);
+  assert.deepEqual(webhookJobOptions.removeOnComplete, { age: 2 * 24 * 60 * 60, count: 2_000 });
+  assert.deepEqual(webhookJobOptions.removeOnFail, { age: 7 * 24 * 60 * 60, count: 1_000 });
 
   const harness = await createHarness();
   try {
@@ -155,7 +156,11 @@ test("successful receiver completes after one HTTP delivery", async () => {
     const finished = await waitForJob(harness.queue, String(job.id));
 
     assert.equal(finished.state, "completed");
-    assert.deepEqual(finished.job.returnvalue, { delivered: true, statusCode: 200 });
+    assert.deepEqual(
+      finished.job.returnvalue,
+      { delivered: true, statusCode: 200 },
+      `unexpected job state ${finished.state}; failure=${finished.job.failedReason}; attempts=${JSON.stringify(finished.job.data.attemptHistory)}`,
+    );
     assert.equal(finished.job.data.attemptHistory.length, 1);
     assert.equal(finished.job.data.attemptHistory[0]?.outcome, "success");
     const operation = await getBusinessOperationRecord(harness.redis, `${job.queueName}:${job.id}`);

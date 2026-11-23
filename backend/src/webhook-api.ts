@@ -1,4 +1,5 @@
 import express, { type Router } from "express";
+import { timingSafeEqual } from "node:crypto";
 import type { Queue } from "bullmq";
 import type Redis from "ioredis";
 import {
@@ -9,6 +10,7 @@ import {
 } from "./webhook-jobs.js";
 import { enqueueWebhookEvent, isValidIdempotencyKey } from "./webhook-idempotency.js";
 import { processBusinessOperationOnce } from "./receiver-idempotency.js";
+import { getPositiveInteger, receiverToken } from "./server-config.js";
 
 const maxWebhookPayloadBytes = 8 * 1024;
 
@@ -69,7 +71,8 @@ export function createWebhookApi(
     }
 
     try {
-      const result = await enqueueWebhookEvent(queue, redis, event, idempotencyKey);
+      const maximumPending = getPositiveInteger("MAX_PENDING_WEBHOOK_JOBS", 500, 100_000);
+      const result = await enqueueWebhookEvent(queue, redis, event, idempotencyKey, maximumPending);
       if (result.status === 503) response.setHeader("Retry-After", String(result.retryAfter));
       response.status(result.status).json("jobId" in result ? { jobId: result.jobId } : { error: result.error });
     } catch {
@@ -108,6 +111,14 @@ export function createWebhookApi(
 
   // These local-only receivers simulate an idempotent business operation in Redis.
   router.post("/test-receivers/:scenario", async (request, response) => {
+    if (process.env.NODE_ENV === "production") {
+      const expected = Buffer.from(receiverToken());
+      const presented = Buffer.from(request.header("x-hookflow-receiver-token") ?? "");
+      if (expected.length !== presented.length || !timingSafeEqual(expected, presented)) {
+        response.status(404).json({ received: false });
+        return;
+      }
+    }
     const scenario = request.params.scenario;
     if (!["success", "transient", "failure", "permanent"].includes(scenario)) {
       response.status(404).json({ received: false });

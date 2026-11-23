@@ -6,7 +6,6 @@ import {
   Braces,
   ChevronRight,
   CircleHelp,
-  Command,
   Fingerprint,
   GitBranch,
   Layers3,
@@ -145,8 +144,7 @@ export default function App() {
 
         <div className="workspace-switcher">
           <div className="workspace-avatar">HF</div>
-          <div className="workspace-copy"><strong>Personal workspace</strong><span>Local environment</span></div>
-          <ChevronRight size={14} />
+          <div className="workspace-copy"><strong>HookFlow workspace</strong><span>{import.meta.env.DEV ? "Local development" : "Configured API"}</span></div>
         </div>
 
         <nav className="side-nav" aria-label="Main navigation">
@@ -157,7 +155,7 @@ export default function App() {
 
           <span className="nav-section-label nav-section-spaced">DEVELOPMENT</span>
           <a className="nav-link" href="#compose"><Braces size={16} /><span>Event composer</span></a>
-          <a className="nav-link" href="#idempotency"><GitBranch size={16} /><span>Retry behavior</span></a>
+          <a className="nav-link" href="#attempts"><GitBranch size={16} /><span>Retry behavior</span></a>
         </nav>
 
         <div className="sidebar-bottom">
@@ -167,11 +165,10 @@ export default function App() {
             </div>
           <span className="sidebar-status-url">{apiBaseUrl.startsWith("http") ? apiBaseUrl : `${apiBaseUrl} via Vite proxy`}</span>
           </div>
-          <a className="nav-link help-link" href="#idempotency"><CircleHelp size={16} /><span>Project guide</span><ChevronRight size={13} /></a>
-          <div className="profile-row">
-            <div className="profile-avatar">U</div>
-            <div className="profile-copy"><strong>Developer</strong><span>HookFlow preview</span></div>
-            <Command size={15} />
+          <a className="nav-link help-link" href="#idempotency"><CircleHelp size={16} /><span>Idempotency guide</span><ChevronRight size={13} /></a>
+          <div className="profile-row" aria-label="HookFlow demo environment">
+            <div className="profile-avatar"><ShieldCheck size={15} /></div>
+            <div className="profile-copy"><strong>Demo environment</strong><span>Server-configured receivers</span></div>
           </div>
         </div>
       </aside>
@@ -180,8 +177,8 @@ export default function App() {
         <header className="topbar">
           <div className="breadcrumbs"><span>Workspace</span><ChevronRight size={13} /><strong>Delivery lab</strong></div>
           <div className="topbar-actions">
-            <span className="environment-tag"><span /> LOCAL DEV</span>
-            <div className="top-avatar">U</div>
+            <span className="environment-tag"><span /> {import.meta.env.DEV ? "LOCAL DEV" : "PRODUCTION API"}</span>
+            <div className="top-avatar" aria-hidden="true"><ShieldCheck size={16} /></div>
           </div>
         </header>
 
@@ -194,14 +191,14 @@ export default function App() {
             </div>
             <div className={`api-connection ${apiOnline ? "connected" : apiOnline === false ? "disconnected" : "checking"}`}>
               <span className="connection-icon"><RadioTower size={17} /></span>
-              <span><strong>{apiOnline ? "Backend connected" : apiOnline === false ? "Backend offline" : "Connecting…"}</strong><small>{apiOnline ? "Health check is responding" : apiOnline === false ? "Check API on port 3000" : "Checking local API"}</small></span>
+              <span><strong>{apiOnline ? "Backend connected" : apiOnline === false ? "Backend offline" : "Connecting…"}</strong><small>{apiOnline ? "Health check is responding" : apiOnline === false ? `Check ${apiBaseUrl}` : "Checking configured API"}</small></span>
               <span className="connection-dot" />
             </div>
           </section>
 
           <div className="notice-strip">
             <div className="notice-icon"><ShieldCheck size={15} /></div>
-            <p><strong>Local test mode</strong> · Requests are sent to the HookFlow API and its configured local receivers. No external webhook URLs are used.</p>
+            <p><strong>Controlled delivery demo</strong> · Scenarios select a server-configured receiver from the allowlist. Event data cannot choose a destination URL.</p>
             <span>SAFE SANDBOX</span>
           </div>
 
@@ -233,7 +230,7 @@ export default function App() {
           </div>
 
           <footer className="page-footer">
-            <span><span className={`footer-dot ${apiOnline ? "" : "footer-dot-muted"}`} /> HookFlow local instance</span>
+            <span><span className={`footer-dot ${apiOnline ? "" : "footer-dot-muted"}`} /> HookFlow {import.meta.env.DEV ? "local" : "deployed"} instance</span>
             <span>Delivery state is read from the BullMQ status API <ArrowDownRight size={13} /></span>
             <a href="#idempotency"><BookOpen size={13} /> Idempotency guide</a>
           </footer>

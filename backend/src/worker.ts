@@ -6,6 +6,7 @@ import {
 } from "./demo-jobs.js";
 import { closeRedisConnection, createWorkerRedisConnection } from "./redis-connection.js";
 import { deliverWebhook } from "./webhook-delivery.js";
+import { getPositiveInteger, receiverBaseUrl } from "./server-config.js";
 import {
   MAX_DELIVERY_ATTEMPTS,
   WEBHOOK_DELIVERY_QUEUE_NAME,
@@ -13,6 +14,8 @@ import {
   type WebhookDeliveryResult,
 } from "./webhook-jobs.js";
 
+// Validate the trusted destination at startup; production must explicitly configure it.
+receiverBaseUrl();
 const redisConnection = createWorkerRedisConnection();
 const worker = new Worker<DemoJobData, DemoJobResult>(
   DEMO_QUEUE_NAME,
@@ -20,15 +23,22 @@ const worker = new Worker<DemoJobData, DemoJobResult>(
     await new Promise((resolve) => setTimeout(resolve, 1_000));
     return { status: "success", message: "Demo job processed" };
   },
-  { connection: redisConnection },
+  { connection: redisConnection, concurrency: getPositiveInteger("DEMO_WORKER_CONCURRENCY", 2, 50) },
 );
 
 const webhookRedisConnection = createWorkerRedisConnection();
 const webhookWorker = new Worker<WebhookEventData, WebhookDeliveryResult>(
   WEBHOOK_DELIVERY_QUEUE_NAME,
   deliverWebhook,
-  { connection: webhookRedisConnection },
+  { connection: webhookRedisConnection, concurrency: getPositiveInteger("WEBHOOK_WORKER_CONCURRENCY", 3, 50) },
 );
+
+redisConnection.on("error", () => {
+  console.error("Demo worker Redis connection encountered an error");
+});
+webhookRedisConnection.on("error", () => {
+  console.error("Webhook worker Redis connection encountered an error");
+});
 
 worker.on("completed", (job) => {
   console.log(`Demo job ${job.id} completed successfully`);
@@ -78,7 +88,11 @@ async function shutdown(signal: string): Promise<void> {
   console.log(`HookFlow worker received ${signal}; waiting for active jobs`);
 
   try {
-    await Promise.all([worker.close(), webhookWorker.close()]);
+    const timeout = new Promise<never>((_, reject) => {
+      const timer = setTimeout(() => reject(new Error("Worker shutdown timed out")), 30_000);
+      timer.unref();
+    });
+    await Promise.race([Promise.all([worker.close(), webhookWorker.close()]), timeout]);
     await Promise.all([
       closeRedisConnection(redisConnection),
       closeRedisConnection(webhookRedisConnection),

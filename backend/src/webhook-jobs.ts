@@ -32,5 +32,6 @@ export interface WebhookDeliveryResult {
 export const webhookJobOptions: JobsOptions = {
   attempts: MAX_DELIVERY_ATTEMPTS,
   backoff: { type: "exponential", delay: INITIAL_BACKOFF_MS },
-  removeOnFail: false,
+  removeOnComplete: { age: 2 * 24 * 60 * 60, count: 2_000 },
+  removeOnFail: { age: 7 * 24 * 60 * 60, count: 1_000 },
 };

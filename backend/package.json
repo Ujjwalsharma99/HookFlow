@@ -6,6 +6,10 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "dev:worker": "tsx watch src/worker.ts",
+    "build": "tsc -p tsconfig.json",
+    "start:api": "node build/index.js",
+    "start:worker": "node build/worker.js",
+    "start:combined": "node build/combined.js",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test --test-concurrency=1 src/*.test.ts"
   },

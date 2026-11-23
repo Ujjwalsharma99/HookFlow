@@ -1,13 +1,20 @@
 import { UnrecoverableError, type Job } from "bullmq";
-import { getApiPort } from "./server-config.js";
+import { receiverBaseUrl, receiverToken } from "./server-config.js";
 import {
   MAX_DELIVERY_ATTEMPTS,
   type DeliveryAttempt,
   type WebhookDeliveryResult,
   type WebhookEventData,
+  type WebhookScenario,
 } from "./webhook-jobs.js";
 
 const requestTimeoutMs = 5_000;
+const receiverPaths: Record<WebhookScenario, string> = {
+  success: "/api/test-receivers/success",
+  transient: "/api/test-receivers/transient",
+  failure: "/api/test-receivers/failure",
+  permanent: "/api/test-receivers/permanent",
+};
 
 async function saveAttempt(job: Job<WebhookEventData>, attempt: DeliveryAttempt): Promise<void> {
   const history = Array.isArray(job.data.attemptHistory) ? job.data.attemptHistory : [];
@@ -15,11 +22,12 @@ async function saveAttempt(job: Job<WebhookEventData>, attempt: DeliveryAttempt)
   await job.updateData({ ...job.data, attemptHistory });
 }
 
-/** Send only to a server-configured local receiver selected by the validated scenario. */
+/** Select a fixed receiver path from a validated scenario under the trusted configured origin. */
 export async function deliverWebhook(
   job: Job<WebhookEventData>,
 ): Promise<WebhookDeliveryResult> {
-  const receiverUrl = `http://127.0.0.1:${getApiPort()}/api/test-receivers/${job.data.scenario}`;
+  const token = receiverToken();
+  const receiverUrl = new URL(receiverPaths[job.data.scenario], receiverBaseUrl());
   const attemptNumber = job.attemptsMade + 1;
   const controller = new AbortController();
   let timedOut = false;
@@ -38,6 +46,7 @@ export async function deliverWebhook(
           "x-hookflow-event-id": `${job.queueName}:${job.id}`,
           "x-hookflow-job-id": String(job.id),
           "x-hookflow-attempt": String(attemptNumber),
+          ...(token ? { "x-hookflow-receiver-token": token } : {}),
         },
         body: JSON.stringify({ eventType: job.data.eventType, payload: job.data.payload }),
         signal: controller.signal,
@@ -51,7 +60,7 @@ export async function deliverWebhook(
         errorCategory,
         outcome: "retryable_failure",
       });
-      throw new Error(timedOut ? "Webhook request timed out" : "Could not reach local webhook receiver");
+      throw new Error(timedOut ? "Webhook request timed out" : "Could not reach configured webhook receiver");
     }
 
     if (response.ok) {
