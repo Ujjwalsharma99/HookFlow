@@ -1,4 +1,4 @@
-import { Worker } from "bullmq";
+import { UnrecoverableError, Worker } from "bullmq";
 import {
   DEMO_QUEUE_NAME,
   type DemoJobData,
@@ -6,7 +6,12 @@ import {
 } from "./demo-jobs.js";
 import { closeRedisConnection, createWorkerRedisConnection } from "./redis-connection.js";
 import { deliverWebhook } from "./webhook-delivery.js";
-import { WEBHOOK_DELIVERY_QUEUE_NAME, type WebhookEventData, type WebhookDeliveryResult } from "./webhook-jobs.js";
+import {
+  MAX_DELIVERY_ATTEMPTS,
+  WEBHOOK_DELIVERY_QUEUE_NAME,
+  type WebhookEventData,
+  type WebhookDeliveryResult,
+} from "./webhook-jobs.js";
 
 const redisConnection = createWorkerRedisConnection();
 const worker = new Worker<DemoJobData, DemoJobResult>(
@@ -41,8 +46,22 @@ webhookWorker.on("completed", (job, result) => {
   console.log(`Webhook delivery job ${job.id} completed with HTTP ${result.statusCode}`);
 });
 
-webhookWorker.on("failed", (job) => {
-  console.error(`Webhook delivery job ${job?.id ?? "unknown"} failed`);
+webhookWorker.on("failed", (job, error) => {
+  if (!job) {
+    console.error("A webhook delivery attempt failed without a job record");
+    return;
+  }
+
+  const maximumAttempts = job.opts.attempts ?? MAX_DELIVERY_ATTEMPTS;
+  if (error instanceof UnrecoverableError) {
+    console.error(`Webhook delivery job ${job.id} failed permanently on attempt ${job.attemptsMade}`);
+  } else if (job.attemptsMade >= maximumAttempts) {
+    console.error(`Webhook delivery job ${job.id} exhausted all ${maximumAttempts} attempts`);
+  } else {
+    console.warn(
+      `Webhook delivery job ${job.id} attempt ${job.attemptsMade} failed; another attempt is scheduled`,
+    );
+  }
 });
 
 webhookWorker.on("error", () => {

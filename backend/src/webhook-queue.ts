@@ -4,11 +4,12 @@ import {
   WEBHOOK_DELIVERY_QUEUE_NAME,
   type WebhookDeliveryResult,
   type WebhookEventData,
+  webhookJobOptions,
 } from "./webhook-jobs.js";
 
 export const webhookQueueRedisConnection = createApiRedisConnection();
 
 export const webhookDeliveryQueue = new Queue<WebhookEventData, WebhookDeliveryResult>(
   WEBHOOK_DELIVERY_QUEUE_NAME,
-  { connection: webhookQueueRedisConnection },
+  { connection: webhookQueueRedisConnection, defaultJobOptions: webhookJobOptions },
 );

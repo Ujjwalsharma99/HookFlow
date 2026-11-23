@@ -1,1 +1,3 @@
-export const apiPort = Number(process.env.PORT) || 3000;
+export function getApiPort(): number {
+  return Number(process.env.PORT) || 3000;
+}

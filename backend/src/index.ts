@@ -2,9 +2,9 @@ import express from "express";
 import type { Server } from "node:http";
 import { demoQueue, demoQueueRedisConnection } from "./demo-queue.js";
 import { closeRedisConnection } from "./redis-connection.js";
-import { apiPort } from "./server-config.js";
+import { getApiPort } from "./server-config.js";
 import { webhookDeliveryQueue, webhookQueueRedisConnection } from "./webhook-queue.js";
-import type { WebhookEventData, WebhookScenario } from "./webhook-jobs.js";
+import { MAX_DELIVERY_ATTEMPTS, type WebhookEventData, type WebhookScenario } from "./webhook-jobs.js";
 
 const app = express();
 const maxWebhookPayloadBytes = 8 * 1024;
@@ -27,7 +27,7 @@ function validateWebhookEvent(body: unknown): WebhookEventData | null {
     eventType.trim().length === 0 ||
     eventType.length > 100 ||
     !isRecord(payload) ||
-    (scenario !== "success" && scenario !== "failure")
+    !["success", "transient", "failure", "permanent"].includes(String(scenario))
   ) {
     return null;
   }
@@ -36,7 +36,7 @@ function validateWebhookEvent(body: unknown): WebhookEventData | null {
     return null;
   }
 
-  return { eventType: eventType.trim(), payload, scenario: scenario as WebhookScenario };
+  return { eventType: eventType.trim(), payload, scenario: scenario as WebhookScenario, attemptHistory: [] };
 }
 
 app.get("/health", (_request, response) => {
@@ -83,7 +83,7 @@ app.post("/api/webhook-events", async (request, response) => {
   const event = validateWebhookEvent(request.body);
   if (!event) {
     response.status(400).json({
-      error: "Provide eventType (up to 100 characters), an object payload (up to 8 KB), and scenario success or failure",
+      error: "Provide eventType (up to 100 characters), an object payload (up to 8 KB), and a valid delivery scenario",
     });
     return;
   }
@@ -106,11 +106,17 @@ app.get("/api/webhook-events/:id", async (request, response) => {
     }
 
     const state = await job.getState();
+    const deliveryAttempts = job.data.attemptHistory ?? [];
     response.json({
       jobId: job.id,
       state,
+      attemptsMade: job.attemptsMade,
+      deliveryAttemptsMade: deliveryAttempts.length,
+      maximumAttempts: job.opts.attempts ?? MAX_DELIVERY_ATTEMPTS,
+      deliveryAttempts,
+      retryScheduled: state === "delayed",
       result: job.returnvalue ?? null,
-      failure: state === "failed" ? job.failedReason : null,
+      failureReason: state === "failed" ? job.failedReason : null,
     });
   } catch {
     console.error("Could not retrieve webhook event because Redis is unavailable");
@@ -123,8 +129,24 @@ app.post("/api/test-receivers/success", (_request, response) => {
   response.status(200).json({ received: true });
 });
 
+app.post("/api/test-receivers/transient", (request, response) => {
+  const jobId = request.header("x-hookflow-job-id");
+  const attemptNumber = Number(request.header("x-hookflow-attempt"));
+  if (!jobId || !Number.isInteger(attemptNumber) || attemptNumber < 1) {
+    response.status(400).json({ received: false });
+    return;
+  }
+
+  // The worker supplies this job's own attempt number, so concurrent jobs never share a counter.
+  response.status(attemptNumber <= 2 ? 500 : 200).json({ received: attemptNumber > 2 });
+});
+
 app.post("/api/test-receivers/failure", (_request, response) => {
   response.status(500).json({ received: false });
+});
+
+app.post("/api/test-receivers/permanent", (_request, response) => {
+  response.status(400).json({ received: false });
 });
 
 demoQueue.on("error", () => {
@@ -135,6 +157,7 @@ webhookDeliveryQueue.on("error", () => {
   console.error("Webhook delivery queue encountered a Redis error");
 });
 
+const apiPort = getApiPort();
 const server: Server = app.listen(apiPort, () => {
   console.log(`HookFlow API listening on port ${apiPort}`);
 });
